@@ -1,17 +1,32 @@
+"""
+Full implementation of a decoder only Generative Pretrained Transformer (GPT). 
+
+Following papers are important references. 
+- Attention is All You Need (Vaswani et al)
+- Improving Language Understanding by Generative Pre-Training (Radford et al)
+- Layer Normalization (Ba et al)
+- Deep Residual Learning for Image Recognition (He et al)
+- Dropout: A Simple Way to Prevent Neural Networks from Overfitting (Srivastava et al)
+
+Also, you need to run this on a GPU. The current parameters should take around 45 minutes on an A100. 
+"""
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+from torch.nn import LayerNorm, functional as F
 
 # hyperparameters
-batch_size = 32 # number of seequences processed in parallel
-context_size = 8 # maximum context length for prediction
-max_iters = 10000
+batch_size = 64 # number of seequences processed in parallel
+context_size = 256 # maximum context length for prediction
+max_iters = 15000
 # when estimating the loss
 eval_interval = 1000
 eval_iters = 200
-learning_rate = 1e-3
-n_embd = 32
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+dropout = 0.2
+n_layer = 6
+n_head = 6
+n_embd = 384
 
 torch.manual_seed(0)
 
@@ -68,7 +83,8 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(context_size, context_size)))
-    
+
+        self.dropout = nn.Dropout(dropout) # add dropout to prevent overfitting
     def forward(self, x):
         # input of size (batch, time, channels)
         # output of size (batch, time-step, head-size)
@@ -81,6 +97,7 @@ class Head(nn.Module):
         weights = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5 # (B, T, hs) @ (B, hs, T) --> (B, T, T)
         weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf')) 
         weights = F.softmax(weights, dim=-1) # (B, T, T)
+        weights = self.dropout(weights)
         v = self.value(x) # (B, T, hs)
         out = weights @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
         return out
@@ -90,19 +107,57 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1) # concatenate over the channel dimension
+        out = torch.cat([h(x) for h in self.heads], dim=-1) # concatenate over the channel dimension
+        # need to project for residual connections
+        out = self.proj(out)
+        out = self.dropout(out)
+        return out
 
-class BigramLM(nn.Module):
+class FeedForward(nn.Module):
+    """A simple linear layer followed by a non-linearty"""
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd), # growing layer in ffwd, following paper. 
+            nn.ReLU(),
+            nn.Linear(4* n_embd, n_embd), # projection for residual
+            nn.Dropout(dropout)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    """ Transformer Block: communication followed by computation. """
+
+    def __init__(self, n_embd, n_head):
+        # n_embd: embedding dimension, n_head: number of heads for multi-head attention
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        # add layer norm to again help with optimization
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+    
+    def forward(self, x):
+        # add residual connections
+        # implement pre norm
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+class GPT(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(context_size, n_embd)
-        # self attention head
-        self.sa_head = MultiHeadAttention(4, n_embd // 4) # 4 Heads of 8-dimensional self-attention 
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
-
     def forward(self, idx, targets=None):
         B, T = idx.shape
 
@@ -110,7 +165,8 @@ class BigramLM(nn.Module):
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
         # add a positional embedding to each token 
         x = tok_emb + pos_emb # (B, T, C)
-        x = self.sa_head(x) # apply one head of self-attention
+        x = self.blocks(x) # apply one head of self-attention
+        x = self.ln(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
         if targets is None:
             loss = None
@@ -131,7 +187,7 @@ class BigramLM(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
 
-model = BigramLM()
+model = GPT()
 m = model.to(device)
 
 # create a PyTorch optimizer
