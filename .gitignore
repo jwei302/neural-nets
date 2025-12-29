@@ -1,6 +1,9 @@
 __pycache__
-*.txt
 .ipynb_checkpoints
 data/
 .vscode
 .cursor
+.DS_Store
+.venv/
+shakespeare.txt
+names.txt
