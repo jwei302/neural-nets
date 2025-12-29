@@ -36,6 +36,8 @@ class CausalSelfAttention(nn.Module):
         v = v.transpose(1, 2) # (B, T, nh, hs) --> (B, nh, T, hs)
         scale = q.shape[-1] ** -0.5
         att = (q @ k.transpose(-2, -1)) * scale # (B, nh, T, T)
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf')) # apply causal mask
+        att = F.softmax(att, dim=-1) # (B, nh, T, T)
         y = att @ v #(B, nh, T, T) x (B, nh, T, hs) --> (B, nh, T, hs)
         # transpose to and bring back head dimension to third dimension
         y = y.transpose(1, 2).contiguous().view(B, T, C) # (B, nh, T, hs) --> (B, T, C)
@@ -109,6 +111,19 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # language model head, project back to logit
 
+    def forward(self, idx): 
+        B, T = idx.shape #(batch size, sequence length)
+        assert T <= self.config.context_size, f"Cannot forward sequence of length {T} when context size is {self.config.context_size}"
+        # token and position embeddings
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        pos_emb = self.transformer.wpe(pos) # (T, n_embd)
+        tok_emb = self.transformer.wte(idx) # (B, T, n_embd)
+        x = tok_emb + pos_emb
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x) # (B, T, vocab_size)
+        return logits
     # use class method to generate a model given the model_type from Hugging Face
     @classmethod
     def from_pretrained(cls, model_type):
@@ -165,5 +180,49 @@ class GPT(nn.Module):
 
 # ------------------------------------------------------------
 if __name__ == "__main__":
+    # choose device 
+    device = 'cpu'
+    if torch.cuda.is_available():
+        device = 'cuda'
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = 'mps'
+    print(f"Using device: {device}")
+
+    num_return_sequences = 5
+    max_length = 30
+
     model = GPT.from_pretrained('gpt2')
-    print("worked")
+    m = model.to(device)
+
+    # tokenize text using tiktoken
+    import tiktoken
+    enc = tiktoken.get_encoding('gpt2')
+    text = "Yale University"
+    tokens = enc.encode(text)
+    tokens = torch.tensor(tokens, dtype=torch.long)
+    x = tokens.unsqueeze(0).repeat(num_return_sequences, 1).to(device) # repeat num_return_sequences time 
+
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    while x.size(1) < max_length:
+        with torch.no_grad():
+            logits = model(x)
+            logits = logits[:, -1, :] # (B, vocab_size)
+            # we only need last token to determine the next token
+            # apply softmax to get probabilities
+            probs = F.softmax(logits, dim=-1) # (B, vocab_size)
+            # do top-k sampling with k=50
+            # top-k sampling: keep the top k probabilities and set the rest to 0
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # (B, 50)
+            # sample from the top k probabilities
+            ix = torch.multinomial(topk_probs, 1) # (B, 1)
+            # use torch.gather to get the indices corresponding to the sampled tokens
+            xnew = topk_indices.gather(-1, ix) # (B, 1)
+            # concatenate new token to existing tokens
+            x = torch.cat((x, xnew), dim=1) # (B, T+1)
+    
+    for i in range(num_return_sequences):
+        tokens = x[i].tolist()
+        decoded = enc.decode(tokens)
+        print('>' + decoded)
