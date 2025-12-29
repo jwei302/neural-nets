@@ -165,7 +165,7 @@ class GPT(nn.Module):
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
         # add a positional embedding to each token 
         x = tok_emb + pos_emb # (B, T, C)
-        x = self.blocks(x) # apply one head of self-attention
+        x = self.blocks(x) # apply several blocks of multi-head attention
         x = self.ln(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
         if targets is None:
