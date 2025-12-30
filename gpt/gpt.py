@@ -30,7 +30,7 @@ n_embd = 384
 
 torch.manual_seed(0)
 
-with open('shakespeare.txt', 'r', encoding='utf-8') as f:
+with open('../data/shakespeare.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
 # all the unique characters in the text
@@ -61,7 +61,7 @@ def get_batch(split):
     return x, y
 
 @torch.no_grad()
-def estimate_loss():
+def estimate_loss(model):
     out = {}
     model.eval()
     for split in ['train', 'val']:
@@ -187,9 +187,9 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
 
-if __name__ == "__main__":
+def main():
     model = GPT()
-    m = model.to(device)
+    model = model.to(device)
 
     # create a PyTorch optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -198,7 +198,7 @@ if __name__ == "__main__":
     for iter in range(max_iters):
         # every eval_interval, estimate the loss on the validation set
         if iter % eval_interval == 0:
-            losses = estimate_loss()
+            losses = estimate_loss(model)
             print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         
         xb, yb = get_batch('train')
@@ -210,3 +210,6 @@ if __name__ == "__main__":
     # generate from the model
     context = torch.zeros((1, 1), dtype=torch.long, device=device)
     print(decode(model.generate(context, new_token_length=500)[0].tolist()))
+
+if __name__ == "__main__":
+    main()
