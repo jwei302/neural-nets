@@ -17,6 +17,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection 
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.FLAG = 1
         self.n_head = config.n_head
 
         # the lower triangular mask that allows for gradual accumulation via weighted averages
@@ -55,6 +56,7 @@ class MLP(nn.Module):
         self.gelu = nn.GELU(approximate='tanh') # can use approximate or precise
         # later models use swiglu and other activations 
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.FLAG = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -111,7 +113,24 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # language model head, project back to logit
 
-    def forward(self, idx): 
+        # weight sharing between wte and lm_head to save memory and improve performance
+        self.transformer.wte.weight = self.lm_head.weight 
+
+        self.apply(self._init_weights)
+
+    # initialize weights for better optimization following OpenAI codebase
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'FLAG'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            # consistent with Xavier initialization which sets initialization as 1 / sqrt(n_incoming_features)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std) 
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    def forward(self, idx, targets=None): 
         B, T = idx.shape #(batch size, sequence length)
         assert T <= self.config.context_size, f"Cannot forward sequence of length {T} when context size is {self.config.context_size}"
         # token and position embeddings
@@ -123,7 +142,11 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
-        return logits
+        if targets is None:
+            loss = None
+        else:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
     # use class method to generate a model given the model_type from Hugging Face
     @classmethod
     def from_pretrained(cls, model_type):
@@ -178,8 +201,36 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
 
+# tokenize text using tiktoken from OpenAI
+import tiktoken
+
+# create a data loader to initialize and return batch of data
+class DataLoader:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        with open('../data/shakespeare.txt', 'r', encoding='utf-8') as f:
+            text = f.read()
+            print(f'Loaded {len(text)} words')
+        enc = tiktoken.get_encoding('gpt2')
+        self.tokens = torch.tensor(enc.encode(text), dtype=torch.long)
+        print(f'Loaded {len(self.tokens)} tokens') # this should be around 1/3 of the total words.
+        print(f'1 Epoch is {self.tokens.size(0) // (B * T)} batches')
+
+        self.current_position = 0
+    def next_batch(self):
+        B, T = self.B, self.T
+        buffer = self.tokens[self.current_position:self.current_position + B * T+1]
+        x = buffer[:-1].view(B, T) # all but last token
+        y = buffer[1:].view(B, T) # all but first token
+        self.current_position += B*T
+        if self.current_position + (B*T+1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
+
 # ------------------------------------------------------------
-if __name__ == "__main__":
+def main():
     # choose device 
     device = 'cpu'
     if torch.cuda.is_available():
@@ -188,41 +239,62 @@ if __name__ == "__main__":
         device = 'mps'
     print(f"Using device: {device}")
 
-    num_return_sequences = 5
-    max_length = 30
+    model = GPT(GPTConfig())
+    model.to(device)
 
-    model = GPT.from_pretrained('gpt2')
-    m = model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    train_loader = DataLoader(B=4, T=8)
+    for i in range(5): 
+        # get batch from dataloader
+        x, y = train_loader.next_batch()
+        # move batch to device
+        x, y = x.to(device), y.to(device)
+        # set to none to avoid memory leaks by setting to zero, default = True
+        optimizer.zero_grad(set_to_none=True)
+        # forward pass, note we use optional targets to compute loss now
+        logits, loss = model(x, y)
+        # backward pass 
+        loss.backward()
+        optimizer.step()
+        print(f'Step {i+1}: loss={loss.item():.4f}')
+    # num_return_sequences = 5
+    # max_length = 30
 
-    # tokenize text using tiktoken
-    import tiktoken
-    enc = tiktoken.get_encoding('gpt2')
-    text = "Yale University"
-    tokens = enc.encode(text)
-    tokens = torch.tensor(tokens, dtype=torch.long)
-    x = tokens.unsqueeze(0).repeat(num_return_sequences, 1).to(device) # repeat num_return_sequences time 
+    # model = GPT.from_pretrained('gpt2')
+    # # for model can do .to(device) to move the model to the device
+    # # but for tensors, we need to do x = x.to(device) to move the tensor to the device
+    # model.to(device)
 
-    torch.manual_seed(0)
-    torch.cuda.manual_seed(0)
+    # enc = tiktoken.get_encoding('gpt2')
+    # text = "Yale University"
+    # tokens = enc.encode(text)
+    # tokens = torch.tensor(tokens, dtype=torch.long)
+    # x = tokens.unsqueeze(0).repeat(num_return_sequences, 1).to(device) # repeat num_return_sequences time 
 
-    while x.size(1) < max_length:
-        with torch.no_grad():
-            logits = model(x)
-            logits = logits[:, -1, :] # (B, vocab_size)
-            # we only need last token to determine the next token
-            # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1) # (B, vocab_size)
-            # do top-k sampling with k=50
-            # top-k sampling: keep the top k probabilities and set the rest to 0
-            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # (B, 50)
-            # sample from the top k probabilities
-            ix = torch.multinomial(topk_probs, 1) # (B, 1)
-            # use torch.gather to get the indices corresponding to the sampled tokens
-            xnew = topk_indices.gather(-1, ix) # (B, 1)
-            # concatenate new token to existing tokens
-            x = torch.cat((x, xnew), dim=1) # (B, T+1)
+    # torch.manual_seed(0)
+    # torch.cuda.manual_seed(0)
+
+    # while x.size(1) < max_length:
+    #     with torch.no_grad():
+    #         logits, loss = model(x)
+    #         logits = logits[:, -1, :] # (B, vocab_size)
+    #         # we only need last token to determine the next token
+    #         # apply softmax to get probabilities
+    #         probs = F.softmax(logits, dim=-1) # (B, vocab_size)
+    #         # do top-k sampling with k=50
+    #         # top-k sampling: keep the top k probabilities and set the rest to 0
+    #         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # (B, 50)
+    #         # sample from the top k probabilities
+    #         ix = torch.multinomial(topk_probs, 1) # (B, 1)
+    #         # use torch.gather to get the indices corresponding to the sampled tokens
+    #         xnew = topk_indices.gather(-1, ix) # (B, 1)
+    #         # concatenate new token to existing tokens
+    #         x = torch.cat((x, xnew), dim=1) # (B, T+1)
     
-    for i in range(num_return_sequences):
-        tokens = x[i].tolist()
-        decoded = enc.decode(tokens)
-        print('>' + decoded)
+    # for i in range(num_return_sequences):
+    #     tokens = x[i].tolist()
+    #     decoded = enc.decode(tokens)
+    #     print('>' + decoded)
+
+if __name__ == "__main__":
+    main()
